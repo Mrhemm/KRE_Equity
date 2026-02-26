@@ -1,8 +1,13 @@
 /****************************************************************************************
-PCA Making for KRE_Equirty
+PCA Making for KRE_Equity
 
-Disusun oleh: Atha 
-Tujuan: Analisis #1
+Disusun oleh: Atha
+Tujuan: Analisis #1 — PCA dari PODES (fasilitas, utilitas, pendidikan, kesehatan);
+        sasaran IUP (has_iup) untuk analisis equity.
+
+Catatan: Untuk merge has_iup, export dulu dari Python:
+  gdf = gpd.read_file("Data/DATA_BERSIH/adm4_podes_2024_with_iup_flag.gpkg")
+  gdf.drop(columns=["geometry"], errors="ignore").to_stata("Data/DATA_BERSIH/adm4_podes_2024_with_iup_flag.dta", write_index=False)
 ****************************************************************************************/
 
 version 17
@@ -12,19 +17,18 @@ set linesize 255
 set maxvar 32767
 
 /****************************************************************************************
-A. PATHS
+A. PATHS (KRE_Equity)
 ****************************************************************************************/
-global spbun_csv "/Users/athamawardi/Desktop/Research-Projects/PSE_Pertamina/Realisasi SPBUN 2024-2025(2024).csv"
-global kel_latlon "/Users/athamawardi/Desktop/Research-Projects/PSE_Pertamina/kelurahan_lat_long.csv"
-
-global podes_main    "/Users/athamawardi/Desktop/Research-Projects/PSE_Pertamina/Podes/podes2024_desa_02..dta"
-global podes_pesisir "/Users/athamawardi/Desktop/Research-Projects/PSE_Pertamina/Podes/Podes kab kota pesisir laut.dta"
-
-global outdir "/Users/athamawardi/Desktop/Research-Projects/PSE_Pertamina/Output/probabilistic"
+global base "/Users/athamawardi/Desktop/Research-Projects/KRE_Equity"
+global podes_main    "$base/Data/PODES_ALL/podes_desa_2024.dta"
+global podes_pesisir ""   /* optional: coastal PODES if available under $base/Data */
+global kel_latlon    ""   /* optional: village lat/lon CSV for coord fallback */
+global data_bersih  "$base/Data/DATA_BERSIH"   /* cleaned gpkg; export to .dta for has_iup merge */
+global outdir "$base/Output/analysis1"
 cap mkdir "$outdir"
 
 cap log close
-log using "$outdir/run_spbun_podes_susenas.log", replace text
+log using "$outdir/run_pca_podes.log", replace text
 
 /****************************************************************************************
 B. PACKAGES
@@ -97,7 +101,8 @@ _std_iddesa10 iddesa
 duplicates drop iddesa, force
 save `MAIN', replace
 
-* D2) PESISIR (prefix p_)
+* D2) PESISIR (prefix p_) — optional
+if trim("$podes_pesisir") != "" {
 use "$podes_pesisir", clear
 rename *, lower
 
@@ -124,10 +129,16 @@ foreach v of local pesvars {
     rename `v' p_`v'
 }
 save `PES', replace
+}
+else {
+    di as txt "PESISIR: skipped (no path set)."
+}
 
 * D3) MERGE MAIN + PESISIR; fill missing from p_*
 use `MAIN', clear
-merge 1:1 iddesa using `PES', nogen keep(master match)
+if trim("$podes_pesisir") != "" {
+    merge 1:1 iddesa using `PES', nogen keep(master match)
+}
 
 capture ds p_*
 if !_rc {
@@ -186,7 +197,7 @@ capture drop r307b_lat r307b_long
 
 * fallback coords from kel_latlon if still missing
 count if missing(lat_v) | missing(lon_v)
-if r(N) > 0 {
+if r(N) > 0 & trim("$kel_latlon") != "" {
     di as txt "Coords missing for " r(N) " villages -> fallback merge from kel_latlon..."
     preserve
         import delimited "$kel_latlon", clear varnames(1) case(preserve) stringcols(_all)
@@ -224,23 +235,59 @@ if r(N) > 0 {
 save "$outdir/podes_vill.dta", replace
 di as result "Saved: $outdir/podes_vill.dta"
 
-
+/****************************************************************************************
+E. OPTIONAL: Merge has_iup from DATA_BERSIH (export adm4_podes_2024 to .dta in Python first)
+****************************************************************************************/
+cap confirm file "$data_bersih/adm4_podes_2024_with_iup_flag.dta"
+if !_rc {
+    di as txt "Merging has_iup from DATA_BERSIH ..."
+    preserve
+        use "$data_bersih/adm4_podes_2024_with_iup_flag.dta", clear
+        cap confirm variable id_desa_numeric
+        if !_rc {
+            tostring id_desa_numeric, replace format("%010.0f")
+            rename id_desa_numeric iddesa
+        }
+        else {
+            cap confirm variable IDDESA
+            if !_rc rename IDDESA iddesa
+        }
+        replace iddesa = trim(iddesa)
+        replace iddesa = subinstr(iddesa," ","",.)
+        replace iddesa = substr("0000000000"+iddesa, strlen("0000000000"+iddesa)-9, 10)
+        keep iddesa has_iup
+        duplicates drop iddesa, force
+        save "$outdir/_has_iup.dta", replace
+    restore
+    use "$outdir/podes_vill.dta", clear
+    merge 1:1 iddesa using "$outdir/_has_iup.dta", nogen keep(master match)
+    replace has_iup = 0 if missing(has_iup)
+    save "$outdir/podes_vill.dta", replace
+    di as result "has_iup merged."
+}
+else {
+    di as txt "Optional: export adm4_podes_2024_with_iup_flag.gpkg to .dta (drop geometry) and save as $data_bersih/adm4_podes_2024_with_iup_flag.dta for has_iup merge."
+}
 
 /****************************************************************************************
 G. PODES ONLY: PCA-ready categorical/ordinal outcome construction
 ****************************************************************************************/
 
 * --------------------------------------------------------------------------------------
-* 0) SPBUN-target label (full sample; no filtering)
+* 0) IUP target (villages with mining license); use merged has_iup if available
 * --------------------------------------------------------------------------------------
-cap drop spbun_target
-gen byte spbun_target = 0
-foreach v in r308b1a r308b1b r308b1c {
-    cap confirm numeric variable `v'
-    if !_rc replace spbun_target = 1 if `v'==1
+cap drop iup_target
+cap confirm variable has_iup
+if !_rc {
+    gen byte iup_target = has_iup
+    label variable iup_target "Village has IUP (mining license)"
 }
-label define spbun_target_lbl 0 "Non-target" 1 "Target (tangkap/budidaya/garam)", replace
-label values spbun_target spbun_target_lbl
+else {
+    gen byte iup_target = 0
+    label variable iup_target "Village has IUP (merge DATA_BERSIH .dta for 0/1)"
+}
+label define iup_target_lbl 0 "No IUP" 1 "Has IUP", replace
+label values iup_target iup_target_lbl
 
 * --------------------------------------------------------------------------------------
 * 1) Helpers
